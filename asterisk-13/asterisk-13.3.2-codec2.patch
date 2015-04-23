@@ -1,0 +1,729 @@
+diff -urpN asterisk-13.3.2-orig/build_tools/menuselect-deps.in asterisk-13.3.2-codec2/build_tools/menuselect-deps.in
+--- asterisk-13.3.2-orig/build_tools/menuselect-deps.in	2015-04-23 05:03:38.114122082 +0600
++++ asterisk-13.3.2-codec2/build_tools/menuselect-deps.in	2015-04-23 05:05:55.618283831 +0600
+@@ -4,6 +4,7 @@ COROSYNC=@PBX_COROSYNC@
+ CRYPTO=@PBX_CRYPTO@
+ BFD=@PBX_BFD@
+ BISON=@PBX_BISON@
++CODEC2=@PBX_CODEC2@
+ CURL=@PBX_CURL@
+ DAHDI=@PBX_DAHDI@
+ DLADDR=@PBX_DLADDR@
+diff -urpN asterisk-13.3.2-orig/channels/iax2/codec_pref.c asterisk-13.3.2-codec2/channels/iax2/codec_pref.c
+--- asterisk-13.3.2-orig/channels/iax2/codec_pref.c	2015-04-23 05:03:38.089122052 +0600
++++ asterisk-13.3.2-codec2/channels/iax2/codec_pref.c	2015-04-23 05:05:55.619283833 +0600
+@@ -352,7 +352,7 @@ static const uint64_t iax2_supported_for
+ 	AST_FORMAT_SIREN14,
+ 	AST_FORMAT_TESTLAW,
+ 	AST_FORMAT_G719,
+-	0, /* Place holder */
++	AST_FORMAT_CODEC2,
+ 	0, /* Place holder */
+ 	0, /* Place holder */
+ 	0, /* Place holder */
+diff -urpN asterisk-13.3.2-orig/channels/iax2/format_compatibility.c asterisk-13.3.2-codec2/channels/iax2/format_compatibility.c
+--- asterisk-13.3.2-orig/channels/iax2/format_compatibility.c	2015-04-23 05:03:38.088122051 +0600
++++ asterisk-13.3.2-codec2/channels/iax2/format_compatibility.c	2015-04-23 05:05:55.619283833 +0600
+@@ -105,6 +105,8 @@ uint64_t iax2_format_compatibility_best(
+ 		AST_FORMAT_G726_AAL2,
+ 		/*! ADPCM has great sound quality and is still pretty easy to translate */
+ 		AST_FORMAT_ADPCM,
++		/* try more advanced codec2 */
++		AST_FORMAT_CODEC2,
+ 		/*! Okay, we're down to vocoders now, so pick GSM because it's small and easier to
+ 		    translate and sounds pretty good */
+ 		AST_FORMAT_GSM,
+diff -urpN asterisk-13.3.2-orig/codecs/codec_codec2.c asterisk-13.3.2-codec2/codecs/codec_codec2.c
+--- asterisk-13.3.2-orig/codecs/codec_codec2.c	1970-01-01 06:00:00.000000000 +0600
++++ asterisk-13.3.2-codec2/codecs/codec_codec2.c	2015-04-23 05:31:06.406115685 +0600
+@@ -0,0 +1,206 @@
++/*
++ * Codec 2 module for Asterisk.
++ *
++ * Credit: codec_gsm.c used as a starting point.
++ *
++ * Copyright (C) 2012 Ed W and David Rowe
++ *
++ * This program is free software, distributed under the terms of
++ * the GNU General Public License Version 2. See the LICENSE file
++ * at the top of the source tree.
++ */
++
++/*! \file
++ *
++ * \brief Translate between signed linear and Codec 2
++ *
++ * \ingroup codecs
++ */
++
++/*** MODULEINFO
++	<depend>codec2</depend>
++	<support_level>core</support_level>
++ ***/
++
++#include "asterisk.h"
++
++#include "asterisk/translate.h"
++#include "asterisk/config.h"
++#include "asterisk/module.h"
++#include "asterisk/utils.h"
++
++#include <codec2/codec2.h>
++
++#define BUFFER_SAMPLES	  8000
++#define CODEC2_SAMPLES    160
++#define	CODEC2_FRAME_LEN  6
++
++/* Sample frame data */
++
++#include "asterisk/slin.h"
++#include "ex_codec2.h"
++
++struct codec2_translator_pvt {	        /* both codec2tolin and lintocodec2 */
++    struct CODEC2 *codec2;
++    int16_t  buf[BUFFER_SAMPLES];	/* lintocodec2, temporary storage */
++};
++
++static int codec2_new(struct ast_trans_pvt *pvt)
++{
++    struct codec2_translator_pvt *tmp = pvt->pvt;
++
++    tmp->codec2 = codec2_create(CODEC2_MODE_2400);
++    if (!tmp)
++        return -1;
++	
++    return 0;
++}
++
++/*! \brief decode and store in outbuf. */
++static int codec2tolin_framein(struct ast_trans_pvt *pvt, struct ast_frame *f)
++{
++    struct codec2_translator_pvt *tmp = pvt->pvt;
++    int x;
++    int16_t *dst = pvt->outbuf.i16;
++    int flen = CODEC2_FRAME_LEN;
++
++    for (x=0; x < f->datalen; x += flen) {
++	unsigned char *src;
++	int len;
++	len = CODEC2_SAMPLES;
++	src = f->data.ptr + x;
++
++	codec2_decode(tmp->codec2, dst + pvt->samples, src);
++
++	pvt->samples += CODEC2_SAMPLES;
++	pvt->datalen += 2 * CODEC2_SAMPLES;
++    }
++    return 0;
++}
++
++/*! \brief store samples into working buffer for later decode */
++static int lintocodec2_framein(struct ast_trans_pvt *pvt, struct ast_frame *f)
++{
++	struct codec2_translator_pvt *tmp = pvt->pvt;
++
++	if (pvt->samples + f->samples > BUFFER_SAMPLES) {
++		ast_log(LOG_WARNING, "Out of buffer space\n");
++		return -1;
++	}
++	memcpy(tmp->buf + pvt->samples, f->data.ptr, f->datalen);
++	pvt->samples += f->samples;
++	return 0;
++}
++
++/*! \brief encode and produce a frame */
++static struct ast_frame *lintocodec2_frameout(struct ast_trans_pvt *pvt)
++{
++	struct codec2_translator_pvt *tmp = pvt->pvt;
++	int datalen = 0;
++	int samples = 0;
++
++	/* We can't work on anything less than a frame in size */
++	if (pvt->samples < CODEC2_SAMPLES)
++		return NULL;
++	while (pvt->samples >= CODEC2_SAMPLES) {
++	    /* Encode a frame of data */
++	    codec2_encode(tmp->codec2, (unsigned char*)(pvt->outbuf.c + datalen), tmp->buf + samples);
++	    datalen += CODEC2_FRAME_LEN;
++	    samples += CODEC2_SAMPLES;
++	    pvt->samples -= CODEC2_SAMPLES;
++	}
++
++	/* Move the data at the end of the buffer to the front */
++	if (pvt->samples)
++		memmove(tmp->buf, tmp->buf + samples, pvt->samples * 2);
++
++	return ast_trans_frameout(pvt, datalen, samples);
++}
++
++static void codec2_destroy_stuff(struct ast_trans_pvt *pvt)
++{
++	struct codec2_translator_pvt *tmp = pvt->pvt;
++	if (tmp->codec2)
++		codec2_destroy(tmp->codec2);
++}
++
++static struct ast_translator codec2tolin = {
++	.name = "codec2tolin",
++	.src_codec = {
++		.name = "codec2",
++		.type = AST_MEDIA_TYPE_AUDIO,
++		.sample_rate = 8000,
++	},
++	.dst_codec = {
++		.name = "slin",
++		.type = AST_MEDIA_TYPE_AUDIO,
++		.sample_rate = 8000,
++	},
++	.format = "slin",
++	.newpvt = codec2_new,
++	.framein = codec2tolin_framein,
++	.destroy = codec2_destroy_stuff,
++	.sample = codec2_sample,
++	.buffer_samples = BUFFER_SAMPLES,
++	.buf_size = BUFFER_SAMPLES * 2,
++	.desc_size = sizeof (struct codec2_translator_pvt ),
++};
++
++static struct ast_translator lintocodec2 = {
++	.name = "lintocodec2",
++	.src_codec = {
++		.name = "slin",
++		.type = AST_MEDIA_TYPE_AUDIO,
++		.sample_rate = 8000,
++	},
++	.dst_codec = {
++		.name = "codec2",
++		.type = AST_MEDIA_TYPE_AUDIO,
++		.sample_rate = 8000,
++	},
++	.format = "codec2",
++	.newpvt = codec2_new,
++	.framein = lintocodec2_framein,
++	.frameout = lintocodec2_frameout,
++	.destroy = codec2_destroy_stuff,
++	.sample = slin8_sample,
++	.desc_size = sizeof (struct codec2_translator_pvt ),
++	.buf_size = (BUFFER_SAMPLES * CODEC2_FRAME_LEN + CODEC2_SAMPLES - 1)/CODEC2_SAMPLES,
++};
++
++/*! \brief standard module glue */
++static int reload(void)
++{
++	return AST_MODULE_LOAD_SUCCESS;
++}
++
++static int unload_module(void)
++{
++	int res;
++
++	res = ast_unregister_translator(&lintocodec2);
++	if (!res)
++		res = ast_unregister_translator(&codec2tolin);
++
++	return res;
++}
++
++static int load_module(void)
++{
++	int res;
++
++	res = ast_register_translator(&codec2tolin);
++	if (!res) 
++		res=ast_register_translator(&lintocodec2);
++	else
++		ast_unregister_translator(&codec2tolin);
++	if (res) 
++		return AST_MODULE_LOAD_FAILURE;
++	return AST_MODULE_LOAD_SUCCESS;
++}
++
++AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_DEFAULT, "Codec 2 Coder/Decoder",
++		.load = load_module,
++		.unload = unload_module,
++		.reload = reload,
++	       );
+diff -urpN asterisk-13.3.2-orig/codecs/codec_dahdi.c asterisk-13.3.2-codec2/codecs/codec_dahdi.c
+--- asterisk-13.3.2-orig/codecs/codec_dahdi.c	2015-04-23 05:03:38.220122204 +0600
++++ asterisk-13.3.2-codec2/codecs/codec_dahdi.c	2015-04-23 05:05:55.620283835 +0600
+@@ -84,6 +84,8 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revisi
+ #define DAHDI_FORMAT_SPEEX     (1 << 9)
+ /*! iLBC Free Compression */
+ #define DAHDI_FORMAT_ILBC      (1 << 10)
++/*! Codec2 best compression */
++#define DAHDI_FORMAT_CODEC2      (1 << 11)
+ #endif
+ 
+ static struct channel_usage {
+@@ -115,6 +117,9 @@ static uint64_t bitfield_dahdi2ast(unsig
+ 	case DAHDI_FORMAT_GSM:
+ 		ast = AST_FORMAT_GSM;
+ 		break;
++	case DAHDI_FORMAT_CODEC2:
++		ast = AST_FORMAT_CODEC2;
++		break;
+ 	case DAHDI_FORMAT_ULAW:
+ 		ast = AST_FORMAT_ULAW;
+ 		break;
+@@ -142,6 +147,9 @@ static uint64_t bitfield_dahdi2ast(unsig
+ 	case DAHDI_FORMAT_ILBC:
+ 		ast = AST_FORMAT_ILBC;
+ 		break;
++	case DAHDI_FORMAT_CODEC2:
++		ast = AST_FORMAT_CODEC2;
++		break;
+ 	default:
+ 		ast = 0;
+ 		break;
+@@ -219,6 +227,11 @@ static const struct ast_codec *get_dahdi
+ 		.type = AST_MEDIA_TYPE_AUDIO,
+ 		.sample_rate = 8000,
+ 	};
++	static const struct ast_codec dahdi_codec2 = {
++		.name = "codec2",
++		.type = AST_MEDIA_TYPE_AUDIO,
++		.sample_rate = 8000,
++	};
+ 
+ 	switch (dahdi_fmt) {
+ 	case DAHDI_FORMAT_G723_1:
+@@ -254,6 +267,9 @@ static const struct ast_codec *get_dahdi
+ 	case DAHDI_FORMAT_ILBC:
+ 		codec = &dahdi_ilbc;
+ 		break;
++	case DAHDI_FORMAT_CODEC2:
++		codec = &dahdi_codec2;
++		break;
+ 	default:
+ 		codec = NULL;
+ 		break;
+@@ -603,6 +619,8 @@ static struct ast_format *dahdi_format_t
+ 		return ast_format_speex;
+ 	case DAHDI_FORMAT_ILBC:
+ 		return ast_format_ilbc;
++	case DAHDI_FORMAT_CODEC2:
++		return ast_format_codec2;
+ 	}
+ 
+ 	/* This will never be reached */
+diff -urpN asterisk-13.3.2-orig/codecs/ex_codec2.h asterisk-13.3.2-codec2/codecs/ex_codec2.h
+--- asterisk-13.3.2-orig/codecs/ex_codec2.h	1970-01-01 06:00:00.000000000 +0600
++++ asterisk-13.3.2-codec2/codecs/ex_codec2.h	2015-04-23 05:26:24.293549933 +0600
+@@ -0,0 +1,29 @@
++/*! \file
++ * \brief 8-bit raw data
++ *
++ * Copyright (C) 2012, 2012 Ed W and David Rowe
++ *
++ * Distributed under the terms of the GNU General Public License
++ *
++ */
++
++static uint8_t ex_codec2[] = {
++    0xea,0xca,0x14,0x85,0x91,0x78
++};
++
++static struct ast_frame *codec2_sample(void)
++{
++	static struct ast_frame f = {
++		.frametype = AST_FRAME_VOICE,
++		.datalen = sizeof(ex_codec2),
++		.samples = CODEC2_SAMPLES,
++		.mallocd = 0,
++		.offset = 0,
++		.src = __PRETTY_FUNCTION__,
++		.data.ptr = ex_codec2,
++	};
++
++	f.subclass.format = ast_format_codec2;
++
++	return &f;
++}
+diff -urpN asterisk-13.3.2-orig/configs/basic-pbx/modules.conf asterisk-13.3.2-codec2/configs/basic-pbx/modules.conf
+--- asterisk-13.3.2-orig/configs/basic-pbx/modules.conf	2015-04-23 05:03:38.317122316 +0600
++++ asterisk-13.3.2-codec2/configs/basic-pbx/modules.conf	2015-04-23 05:05:55.623283841 +0600
+@@ -30,6 +30,7 @@ load = codec_gsm.so
+ load = codec_resample.so
+ load = codec_ulaw.so
+ load = codec_g722.so
++load = codec_codec2.so
+ 
+ ; Formats
+ 
+@@ -37,6 +38,7 @@ load = format_gsm.so
+ load = format_pcm.so
+ load = format_wav_gsm.so
+ load = format_wav.so
++load = format_codec2.so
+ 
+ ; Functions
+ 
+diff -urpN asterisk-13.3.2-orig/configure.ac asterisk-13.3.2-codec2/configure.ac
+--- asterisk-13.3.2-orig/configure.ac	2015-04-23 05:03:38.327122328 +0600
++++ asterisk-13.3.2-codec2/configure.ac	2015-04-23 05:05:55.620283835 +0600
+@@ -404,6 +404,7 @@ AST_EXT_LIB_SETUP([BFD], [Debug symbol d
+ AST_EXT_LIB_SETUP([BKTR], [Stack Backtrace], [execinfo])
+ AST_EXT_LIB_SETUP([BLUETOOTH], [Bluetooth], [bluetooth])
+ AST_EXT_LIB_SETUP([CAP], [POSIX 1.e capabilities], [cap])
++AST_EXT_LIB_SETUP([CODEC2], [Codec 2], [codec2])
+ AST_EXT_LIB_SETUP([COROSYNC], [Corosync], [cpg])
+ AST_EXT_LIB_SETUP_OPTIONAL([COROSYNC_CFG_STATE_TRACK], [A callback only in corosync 1.x], [COROSYNC], [cfg])
+ AST_EXT_LIB_SETUP([CURSES], [curses], [curses])
+@@ -2247,6 +2248,8 @@ else
+ 	AST_EXT_LIB_CHECK([RADIUS], [radiusclient-ng], [rc_read_config], [radiusclient-ng.h])
+ fi
+ 
++AST_EXT_LIB_CHECK([CODEC2], [codec2], [codec2_create], [codec2/codec2.h], [-lcodec2])
++
+ AST_EXT_LIB_CHECK([COROSYNC], [cpg], [cpg_join], [corosync/cpg.h], [-lcfg])
+ AST_EXT_LIB_CHECK([COROSYNC_CFG_STATE_TRACK], [cfg], [corosync_cfg_state_track], [corosync/cfg.h], [-lcfg])
+ 
+diff -urpN asterisk-13.3.2-orig/formats/format_codec2.c asterisk-13.3.2-codec2/formats/format_codec2.c
+--- asterisk-13.3.2-orig/formats/format_codec2.c	1970-01-01 06:00:00.000000000 +0600
++++ asterisk-13.3.2-codec2/formats/format_codec2.c	2015-04-23 06:42:55.366974044 +0600
+@@ -0,0 +1,137 @@
++/*
++ * Asterisk -- An open source telephony toolkit.
++ *
++ * Credit: format_gsm.c used as a starting point.
++ *
++ * Copyright (C) 2012 Ed W and David Rowe
++ * Copyright (C) 2015 Pasichnichenko K.
++ *
++ * This program is free software, distributed under the terms of
++ * the GNU General Public License Version 2. See the LICENSE file
++ * at the top of the source tree.
++ */
++
++/*! \file
++ *
++ * \brief Save to raw, headerless Codec2 data.
++ * \arg File name extension: codec2
++ * \ingroup formats
++ */
++
++/*** MODULEINFO
++	<support_level>core</support_level>
++ ***/
++ 
++#include "asterisk.h"
++
++#include "asterisk/mod_format.h"
++#include "asterisk/module.h"
++#include "asterisk/endian.h"
++#include "asterisk/format_cache.h"
++
++#include <codec2/codec2.h>
++
++/* Some Ideas for this code came from makegsme.c by Jeffrey Chilton */
++
++/* Portions of the conversion code are by guido@sienanet.it */
++
++#define	CODEC2_FRAME_LEN	6
++#define	CODEC2_SAMPLES	160
++
++static struct ast_frame *codec2_read(struct ast_filestream *s, int *whennext)
++{
++	int res;
++
++	AST_FRAME_SET_BUFFER(&(s->fr), s->buf, AST_FRIENDLY_OFFSET, CODEC2_FRAME_LEN)
++	if ((res = fread(s->fr.data.ptr, 1, CODEC2_FRAME_LEN, s->f)) != CODEC2_FRAME_LEN) {
++		if (res)
++			ast_log(LOG_WARNING, "Short read (%d) (%s)!\n", res, strerror(errno));
++		return NULL;
++	}
++	*whennext = s->fr.samples = CODEC2_SAMPLES;
++	return &s->fr;
++}
++
++static int codec2_write(struct ast_filestream *fs, struct ast_frame *f)
++{
++	int res;
++
++	if (f->datalen <= 0) {
++		ast_log(LOG_WARNING, "Short frame ignored (%d bytes long?)\n", f->datalen);
++		return 0;
++	}
++	if (f->datalen % CODEC2_FRAME_LEN) {
++		ast_log(LOG_WARNING, "Invalid data length, %d, should be multiple of %d\n", f->datalen, CODEC2_FRAME_LEN);
++		return -1;
++	}
++	if ((res = fwrite(f->data.ptr, 1, f->datalen, fs->f)) != f->datalen) {
++			ast_log(LOG_WARNING, "Bad write (%d/33): %s\n", res, strerror(errno));
++			return -1;
++	}
++	return 0;
++}
++
++static int codec2_seek(struct ast_filestream *fs, off_t sample_offset, int whence)
++{
++	return -1;
++}
++
++static int codec2_trunc(struct ast_filestream *fs)
++{
++	int fd;
++	off_t cur;
++
++	if ((fd = fileno(fs->f)) < 0) {
++		ast_log(AST_LOG_WARNING, "Unable to determine file descriptor for codec2 filestream %p: %s\n", fs, strerror(errno));
++		return -1;
++	}
++	if ((cur = ftello(fs->f)) < 0) {
++		ast_log(AST_LOG_WARNING, "Unable to determine current position in codec2 filestream %p: %s\n", fs, strerror(errno));
++		return -1;
++	}
++	/* Truncate file to current length */
++	return ftruncate(fd, cur);
++}
++
++static off_t codec2_tell(struct ast_filestream *fs)
++{
++	off_t offset = ftello(fs->f);
++
++	if (offset < 0) {
++		ast_log(AST_LOG_WARNING, "Unable to determine offset for codec2 filestream %p: %s\n", fs, strerror(errno));
++		return 0;
++	}
++
++	return (offset / CODEC2_FRAME_LEN) * CODEC2_SAMPLES;
++}
++
++static struct ast_format_def codec2_f = {
++	.name = "codec2",
++	.exts = "codec2",
++	.write = codec2_write,
++	.seek =	codec2_seek,
++	.trunc = codec2_trunc,
++	.tell =	codec2_tell,
++	.read =	codec2_read,
++	.buf_size = 2*CODEC2_FRAME_LEN + AST_FRIENDLY_OFFSET,	/* 2 codec2 frames */
++};
++
++static int load_module(void)
++{
++	codec2_f.format = ast_format_codec2;
++	if (ast_format_def_register(&codec2_f))
++		return AST_MODULE_LOAD_FAILURE;
++	return AST_MODULE_LOAD_SUCCESS;
++}
++
++static int unload_module(void)
++{
++	return ast_format_def_unregister(codec2_f.name);
++}
++
++AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_LOAD_ORDER, "Raw Codec2 data",
++	.support_level = AST_MODULE_SUPPORT_CORE,
++	.load = load_module,
++	.unload = unload_module,
++	.load_pri = AST_MODPRI_APP_DEPEND
++);
+diff -urpN asterisk-13.3.2-orig/include/asterisk/format_cache.h asterisk-13.3.2-codec2/include/asterisk/format_cache.h
+--- asterisk-13.3.2-orig/include/asterisk/format_cache.h	2015-04-23 05:03:38.329122332 +0600
++++ asterisk-13.3.2-codec2/include/asterisk/format_cache.h	2015-04-23 05:05:55.621283837 +0600
+@@ -209,6 +209,11 @@ extern struct ast_format *ast_format_sir
+ extern struct ast_format *ast_format_opus;
+ 
+ /*!
++ * \brief Built-in cached codec2 format.
++ */
++extern struct ast_format *ast_format_codec2;
++
++/*!
+  * \brief Built-in cached t140 format.
+  */
+ extern struct ast_format *ast_format_t140;
+diff -urpN asterisk-13.3.2-orig/include/asterisk/format_compatibility.h asterisk-13.3.2-codec2/include/asterisk/format_compatibility.h
+--- asterisk-13.3.2-orig/include/asterisk/format_compatibility.h	2015-04-23 05:03:38.342122346 +0600
++++ asterisk-13.3.2-codec2/include/asterisk/format_compatibility.h	2015-04-23 05:05:55.621283837 +0600
+@@ -71,6 +71,8 @@ struct ast_codec;
+ #define AST_FORMAT_SPEEX16 (1ULL << 33)
+ /*! Opus audio (8kHz, 16kHz, 24kHz, 48Khz) */
+ #define AST_FORMAT_OPUS (1ULL << 34)
++/*! Codec 2 (8kHz) */
++#define AST_FORMAT_CODEC2 (1ULL << 35)
+ /*! Raw testing-law data (G.711) */
+ #define AST_FORMAT_TESTLAW (1ULL << 47)
+ /*! H.261 Video */
+diff -urpN asterisk-13.3.2-orig/main/codec_builtin.c asterisk-13.3.2-codec2/main/codec_builtin.c
+--- asterisk-13.3.2-orig/main/codec_builtin.c	2015-04-23 05:03:38.353122358 +0600
++++ asterisk-13.3.2-codec2/main/codec_builtin.c	2015-04-23 05:05:55.624283843 +0600
+@@ -709,6 +709,30 @@ static struct ast_codec opus = {
+ 	.minimum_bytes = 10,
+ };
+ 
++static int codec2_samples(struct ast_frame *frame)
++{
++	return 160 * (frame->datalen / 33);
++}
++
++static int codec2_length(unsigned int samples)
++{
++	return (samples / 160) * 33;
++}
++
++static struct ast_codec codec2 = {
++	.name = "codec2",
++	.description = "Codec2",
++	.type = AST_MEDIA_TYPE_AUDIO,
++	.sample_rate = 8000,
++	.minimum_ms = 20,
++	.maximum_ms = 300,
++	.default_ms = 20,
++	.minimum_bytes = 33,
++	.samples_count = codec2_samples,
++	.get_length = codec2_length,
++	.smooth = 1,
++};
++
+ static struct ast_codec jpeg = {
+ 	.name = "jpeg",
+ 	.description = "JPEG image",
+@@ -805,6 +829,7 @@ int ast_codec_builtin_init(void)
+ 	res |= CODEC_REGISTER_AND_CACHE(ulaw);
+ 	res |= CODEC_REGISTER_AND_CACHE(alaw);
+ 	res |= CODEC_REGISTER_AND_CACHE(gsm);
++	res |= CODEC_REGISTER_AND_CACHE(codec2);
+ 	res |= CODEC_REGISTER_AND_CACHE(g726rfc3551);
+ 	res |= CODEC_REGISTER_AND_CACHE(g726aal2);
+ 	res |= CODEC_REGISTER_AND_CACHE(adpcm);
+diff -urpN asterisk-13.3.2-orig/main/format_cache.c asterisk-13.3.2-codec2/main/format_cache.c
+--- asterisk-13.3.2-orig/main/format_cache.c	2015-04-23 05:03:38.350122355 +0600
++++ asterisk-13.3.2-codec2/main/format_cache.c	2015-04-23 05:05:55.622283839 +0600
+@@ -218,6 +218,11 @@ struct ast_format *ast_format_siren7;
+ struct ast_format *ast_format_opus;
+ 
+ /*!
++ * \brief Built-in cached codec2 format.
++ */
++struct ast_format *ast_format_codec2;
++
++/*!
+  * \brief Built-in cached t140 format.
+  */
+ struct ast_format *ast_format_t140;
+@@ -320,6 +325,7 @@ static void format_cache_shutdown(void)
+ 	ao2_replace(ast_format_testlaw, NULL);
+ 	ao2_replace(ast_format_g719, NULL);
+ 	ao2_replace(ast_format_opus, NULL);
++	ao2_replace(ast_format_codec2, NULL);
+ 	ao2_replace(ast_format_jpeg, NULL);
+ 	ao2_replace(ast_format_png, NULL);
+ 	ao2_replace(ast_format_h261, NULL);
+@@ -404,6 +410,8 @@ static void set_cached_format(const char
+ 		ao2_replace(ast_format_g719, format);
+ 	} else if (!strcmp(name, "opus")) {
+ 		ao2_replace(ast_format_opus, format);
++	} else if (!strcmp(name, "codec2")) {
++		ao2_replace(ast_format_codec2, format);
+ 	} else if (!strcmp(name, "jpeg")) {
+ 		ao2_replace(ast_format_jpeg, format);
+ 	} else if (!strcmp(name, "png")) {
+diff -urpN asterisk-13.3.2-orig/main/format_compatibility.c asterisk-13.3.2-codec2/main/format_compatibility.c
+--- asterisk-13.3.2-orig/main/format_compatibility.c	2015-04-23 05:03:38.353122358 +0600
++++ asterisk-13.3.2-codec2/main/format_compatibility.c	2015-04-23 05:05:55.622283839 +0600
+@@ -78,6 +78,8 @@ uint64_t ast_format_compatibility_format
+ 		return AST_FORMAT_SPEEX16;
+ 	} else if (ast_format_cmp(format, ast_format_opus) == AST_FORMAT_CMP_EQUAL) {
+ 		return AST_FORMAT_OPUS;
++	} else if (ast_format_cmp(format, ast_format_codec2) == AST_FORMAT_CMP_EQUAL) {
++		return AST_FORMAT_CODEC2;
+ 	} else if (ast_format_cmp(format, ast_format_testlaw) == AST_FORMAT_CMP_EQUAL) {
+ 		return AST_FORMAT_TESTLAW;
+ 	} else if (ast_format_cmp(format, ast_format_h261) == AST_FORMAT_CMP_EQUAL) {
+@@ -145,6 +147,8 @@ uint64_t ast_format_compatibility_codec2
+ 		return AST_FORMAT_SPEEX16;
+ 	} else if (codec->id == ast_format_get_codec_id(ast_format_opus)) {
+ 		return AST_FORMAT_OPUS;
++	} else if (codec->id == ast_format_get_codec_id(ast_format_codec2)) {
++		return AST_FORMAT_CODEC2;
+ 	} else if (codec->id == ast_format_get_codec_id(ast_format_testlaw)) {
+ 		return AST_FORMAT_TESTLAW;
+ 	} else if (codec->id == ast_format_get_codec_id(ast_format_h261)) {
+@@ -232,6 +236,9 @@ struct ast_format *ast_format_compatibil
+ 	/*! Opus audio (8kHz, 16kHz, 24kHz, 48Khz) */
+ 	case AST_FORMAT_OPUS:
+ 		return ast_format_opus;
++	/*! Codec 2 (8kHz) */
++	case AST_FORMAT_CODEC2:
++		return ast_format_codec2;
+ 	/*! Raw mu-law data (G.711) */
+ 	case AST_FORMAT_TESTLAW:
+ 		return ast_format_testlaw;
+diff -urpN asterisk-13.3.2-orig/main/rtp_engine.c asterisk-13.3.2-codec2/main/rtp_engine.c
+--- asterisk-13.3.2-orig/main/rtp_engine.c	2015-04-23 05:03:38.347122352 +0600
++++ asterisk-13.3.2-codec2/main/rtp_engine.c	2015-04-23 05:48:56.009771258 +0600
+@@ -2097,6 +2097,7 @@ int ast_rtp_engine_init()
+ 	/* Define all the RTP mime types available */
+ 	set_next_mime_type(ast_format_g723, 0, "audio", "G723", 8000);
+ 	set_next_mime_type(ast_format_gsm, 0, "audio", "GSM", 8000);
++	set_next_mime_type(ast_format_codec2, 0, "audio", "codec2", 8000);
+ 	set_next_mime_type(ast_format_ulaw, 0, "audio", "PCMU", 8000);
+ 	set_next_mime_type(ast_format_ulaw, 0, "audio", "G711U", 8000);
+ 	set_next_mime_type(ast_format_alaw, 0, "audio", "PCMA", 8000);
+@@ -2150,6 +2151,7 @@ int ast_rtp_engine_init()
+ 	add_static_payload(9, ast_format_g722, 0);
+ 	add_static_payload(10, ast_format_slin, 0); /* 2 channels */
+ 	add_static_payload(11, ast_format_slin, 0); /* 1 channel */
++	add_static_payload(12, ast_format_codec2, 0); /* Ex-Qualcomm QCELP 8 kHz */
+ 	add_static_payload(13, NULL, AST_RTP_CN);
+ 	add_static_payload(16, ast_format_adpcm, 0); /* 11.025 kHz */
+ 	add_static_payload(17, ast_format_adpcm, 0); /* 22.050 kHz */
+diff -urpN asterisk-13.3.2-orig/makeopts.in asterisk-13.3.2-codec2/makeopts.in
+--- asterisk-13.3.2-orig/makeopts.in	2015-04-23 05:03:38.318122318 +0600
++++ asterisk-13.3.2-codec2/makeopts.in	2015-04-23 05:05:55.623283841 +0600
+@@ -124,6 +124,9 @@ BFD_LIB=@BFD_LIB@
+ BLUETOOTH_INCLUDE=@BLUETOOTH_INCLUDE@
+ BLUETOOTH_LIB=@BLUETOOTH_LIB@
+ 
++CODEC2_INCLUDE=@CODEC2_INCLUDE@
++CODEC2_LIB=@CODEC2_LIB@
++
+ CURL_INCLUDE=@CURL_INCLUDE@
+ CURL_LIB=@CURL_LIB@
+ 
+diff -urpN asterisk-13.3.2-orig/menuselect/example_menuselect-tree asterisk-13.3.2-codec2/menuselect/example_menuselect-tree
+--- asterisk-13.3.2-orig/menuselect/example_menuselect-tree	2015-04-23 05:03:38.202122183 +0600
++++ asterisk-13.3.2-codec2/menuselect/example_menuselect-tree	2015-04-23 05:05:55.623283841 +0600
+@@ -245,6 +245,9 @@
+ 		<member name="codec_gsm" displayname="GSM/PCM16 (signed linear) Codec Translator" remove_on_change="codecs/codec_gsm.o codecs/codec_gsm.so">
+ 	<depend>libgsm</depend>
+ 		</member>
++		<member name="codec_codec2" displayname="Codec2 (8 kHz) Codec Translator" remove_on_change="codecs/codec_codec2.o codecs/codec_codec2.so">
++	<depend>libcodec2</depend>
++		</member>
+ 		<member name="codec_ilbc" displayname="iLBC/PCM16 (signed linear) Codec Translator" remove_on_change="codecs/codec_ilbc.o codecs/codec_ilbc.so">
+ 		</member>
+ 		<member name="codec_lpc10" displayname="LPC10 2.4kbps (signed linear) Voice Coder" remove_on_change="codecs/codec_lpc10.o codecs/codec_lpc10.so">
+@@ -267,6 +270,8 @@
+ 		</member>
+ 		<member name="format_gsm" displayname="Raw GSM data" remove_on_change="formats/format_gsm.o formats/format_gsm.so">
+ 		</member>
++		<member name="format_codec2" displayname="Raw Codec2 data" remove_on_change="formats/format_codec2.o formats/format_codec2.so">
++		</member>
+ 		<member name="format_h263" displayname="Raw h263 data" remove_on_change="formats/format_h263.o formats/format_h263.so">
+ 		</member>
+ 		<member name="format_h264" displayname="Raw h264 data" remove_on_change="formats/format_h264.o formats/format_h264.so">
+diff -urpN asterisk-13.3.2-orig/menuselect/test/menuselect-tree asterisk-13.3.2-codec2/menuselect/test/menuselect-tree
+--- asterisk-13.3.2-orig/menuselect/test/menuselect-tree	2015-04-23 05:03:38.202122183 +0600
++++ asterisk-13.3.2-codec2/menuselect/test/menuselect-tree	2015-04-23 05:05:55.624283843 +0600
+@@ -291,6 +291,9 @@
+ <member name="codec_gsm" displayname="GSM Coder/Decoder" remove_on_change="codecs/codec_gsm.o codecs/codec_gsm.so">
+ 	<depend>gsm</depend>
+ </member>
++<member name="codec_codec2" displayname="Codec2 Coder/Decoder" remove_on_change="codecs/codec_codec2.o codecs/codec_codec2.so">
++	<depend>codec2</depend>
++</member>
+ <member name="codec_ilbc" displayname="iLBC Coder/Decoder" remove_on_change="codecs/codec_ilbc.o codecs/codec_ilbc.so">
+ 	<defaultenabled>no</defaultenabled>
+ </member>
+@@ -316,6 +319,8 @@
+ </member>
+ <member name="format_gsm" displayname="Raw GSM data" remove_on_change="formats/format_gsm.o formats/format_gsm.so">
+ </member>
++<member name="format_codec2" displayname="Raw Codec2 data" remove_on_change="formats/format_codec2.o formats/format_codec2.so">
++</member>
+ <member name="format_h263" displayname="Raw H.263 data" remove_on_change="formats/format_h263.o formats/format_h263.so">
+ </member>
+ <member name="format_h264" displayname="Raw H.264 data" remove_on_change="formats/format_h264.o formats/format_h264.so">
