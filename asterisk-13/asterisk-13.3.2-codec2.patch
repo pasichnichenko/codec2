@@ -449,7 +449,7 @@ diff -urpN asterisk-13.3.2-orig/formats/format_codec2.c asterisk-13.3.2-codec2/f
 +		return -1;
 +	}
 +	if ((res = fwrite(f->data.ptr, 1, f->datalen, fs->f)) != f->datalen) {
-+			ast_log(LOG_WARNING, "Bad write (%d/33): %s\n", res, strerror(errno));
++			ast_log(LOG_WARNING, "Bad write (%d/6): %s\n", res, strerror(errno));
 +			return -1;
 +	}
 +	return 0;
@@ -555,12 +555,12 @@ diff -urpN asterisk-13.3.2-orig/main/codec_builtin.c asterisk-13.3.2-codec2/main
  
 +static int codec2_samples(struct ast_frame *frame)
 +{
-+	return 160 * (frame->datalen / 33);
++	return 160 * (frame->datalen / 6);
 +}
 +
 +static int codec2_length(unsigned int samples)
 +{
-+	return (samples / 160) * 33;
++	return (samples / 160) * 6;
 +}
 +
 +static struct ast_codec codec2 = {
@@ -571,7 +571,7 @@ diff -urpN asterisk-13.3.2-orig/main/codec_builtin.c asterisk-13.3.2-codec2/main
 +	.minimum_ms = 20,
 +	.maximum_ms = 300,
 +	.default_ms = 20,
-+	.minimum_bytes = 33,
++	.minimum_bytes = 6,
 +	.samples_count = codec2_samples,
 +	.get_length = codec2_length,
 +	.smooth = 1,
